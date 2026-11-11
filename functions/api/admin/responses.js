@@ -1,15 +1,127 @@
-const json=(value,status=200)=>new Response(JSON.stringify(value),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
-export async function onRequestPost({request,env}) {
-  if (!env.DB) return json({error:'Database unavailable'},503);
-  const ct=request.headers.get('content-type')||'';
-  if (!ct.includes('application/json')) return json({error:'JSON required'},415);
-  if (Number(request.headers.get('content-length')||0)>30000) return json({error:'Too large'},413);
-  let body; try {body=await request.json()}catch{return json({error:'Invalid JSON'},400)}
-  const name=String(body?.name||'').trim(),age=Number(body?.age),answers=body?.answers;
-  if (!name||name.length>100||!Number.isInteger(age)||age<23||age>40||!answers||typeof answers!=='object'||Array.isArray(answers))return json({error:'Invalid input'},400);
-  if (answers.name!==name||Number(answers.age)!==age||!answers.selfType||!answers.jcti)return json({error:'Incomplete input'},400);
-  const serialized=JSON.stringify(answers);
-  if (serialized.length>20000)return json({error:'Too large'},413);
-  try {await env.DB.prepare('INSERT INTO responses (name,age,answers_json) VALUES (?,?,?)').bind(name,age,serialized).run();return json({ok:true},201)}catch{return json({error:'Save failed'},503)}
+const reply = (data, status = 200) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store"
+    }
+  });
+
+export async function onRequestGet({ request, env }) {
+  if (!env.DB) {
+    return reply({ error: "Database unavailable" }, 503);
+  }
+
+  // Cloudflare Accessの認証設定が必須
+  const token = request.headers.get("Cf-Access-Jwt-Assertion");
+
+  if (!token || !env.ACCESS_AUD || !env.ACCESS_TEAM_DOMAIN) {
+    return reply({ error: "Authentication required" }, 403);
+  }
+
+  try {
+    const jwksUrl =
+      `https://${env.ACCESS_TEAM_DOMAIN}/cdn-cgi/access/certs`;
+
+    const jwksResponse = await fetch(jwksUrl);
+    if (!jwksResponse.ok) {
+      return reply({ error: "Authentication unavailable" }, 503);
+    }
+
+    const { keys } = await jwksResponse.json();
+    const parts = token.split(".");
+    if (parts.length !== 3) {
+      return reply({ error: "Invalid token" }, 403);
+    }
+
+    const decode = (part) => {
+      const base64 = part.replace(/-/g, "+").replace(/_/g, "/");
+      const bytes = Uint8Array.from(
+        atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, "=")),
+        c => c.charCodeAt(0)
+      );
+      return JSON.parse(new TextDecoder().decode(bytes));
+    };
+
+    const header = decode(parts[0]);
+    const payload = decode(parts[1]);
+
+    if (header.alg !== "RS256") {
+      return reply({ error: "Invalid algorithm" }, 403);
+    }
+
+    const key = keys.find(k =>
+      k.kid === header.kid && k.kty === "RSA"
+    );
+
+    if (!key) {
+      return reply({ error: "Invalid signing key" }, 403);
+    }
+
+    const cryptoKey = await crypto.subtle.importKey(
+      "jwk",
+      key,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["verify"]
+    );
+
+    const signature = Uint8Array.from(
+      atob(parts[2].replace(/-/g, "+")
+        .replace(/_/g, "/")
+        .padEnd(Math.ceil(parts[2].length / 4) * 4, "=")),
+      c => c.charCodeAt(0)
+    );
+
+    const valid = await crypto.subtle.verify(
+      "RSASSA-PKCS1-v1_5",
+      cryptoKey,
+      signature,
+      new TextEncoder().encode(`${parts[0]}.${parts[1]}`)
+    );
+
+    const now = Math.floor(Date.now() / 1000);
+    const audience = Array.isArray(payload.aud)
+      ? payload.aud
+      : [payload.aud];
+
+    if (
+      !valid ||
+      !audience.includes(env.ACCESS_AUD) ||
+      payload.iss !==
+        `https://${env.ACCESS_TEAM_DOMAIN}` ||
+      !Number.isFinite(payload.exp) ||
+      payload.exp <= now ||
+      !Number.isFinite(payload.nbf) ||
+      payload.nbf > now
+    ) {
+      return reply({ error: "Access denied" }, 403);
+    }
+
+    const result = await env.DB.prepare(
+      `SELECT id, name, age, submitted_at, answers_json
+       FROM responses
+       ORDER BY id DESC
+       LIMIT 1000`
+    ).all();
+
+    return reply({
+      ok: true,
+      total: result.results.length,
+      responses: result.results.map(row => ({
+        id: row.id,
+        name: row.name,
+        age: row.age,
+        submitted_at: row.submitted_at,
+        answers: JSON.parse(row.answers_json)
+      }))
+    });
+
+  } catch {
+    return reply({ error: "Request failed" }, 503);
+  }
 }
-export function onRequestGet(){return json({error:'Method not allowed'},405)}
+
+export function onRequestPost() {
+  return reply({ error: "Method not allowed" }, 405);
+}
