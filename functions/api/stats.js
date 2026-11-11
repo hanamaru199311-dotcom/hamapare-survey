@@ -5,7 +5,7 @@ export async function onRequestGet({env}){
  try{
   const count=await env.DB.prepare('SELECT COUNT(*) AS n FROM responses').first();
   const n=Number(count?.n||0);
-  if(n<10)return json({ready:false,message:'個人を推測できないよう、10件以上集まると集計を表示します。'});
+  if(n===0)return json({ready:true,total:0,groups:[],note:'まだ回答がありません。'});
   const out=[];
   for(const q of META){
     // Count predefined options in SQL. Never return raw answers, names or free text.
@@ -17,10 +17,10 @@ export async function onRequestGet({env}){
         ? `SELECT COUNT(*) AS n FROM responses WHERE json_valid(answers_json) AND EXISTS (SELECT 1 FROM json_each(answers_json, ?) WHERE value=?)`
         : `SELECT COUNT(*) AS n FROM responses WHERE json_valid(answers_json) AND json_extract(answers_json, ?)=?`;
       const r=await env.DB.prepare(query).bind(path,opt).first();
-      if(Number(r?.n||0)>=5)visible.push({label:opt,count:Number(r.n)});
+      if(Number(r?.n||0)>0)visible.push({label:opt,count:Number(r.n)});
     }
     if(visible.length)out.push({title:q.title,items:visible});
   }
-  return json({ready:true,groups:out,note:'5件未満の選択肢は非表示。自由記述・氏名・個別回答は公開していません。'});
+  return json({ready:true,total:n,groups:out,note:'自由記述・氏名・個別回答は公開していません。'});
  }catch(e){return json({error:'集計処理に失敗しました'},503)}
 }
